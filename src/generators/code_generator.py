@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 
 import google.generativeai as genai
 from dotenv import load_dotenv
@@ -27,12 +28,55 @@ model = genai.GenerativeModel(
 
 
 # =========================================================
+# CONSTANTS
+# =========================================================
+
+MAX_GENERATION_ATTEMPTS = 3
+
+
+# =========================================================
+# SAVE RAW RESPONSE
+# =========================================================
+
+def save_invalid_response(text, attempt):
+    """
+    Save Gemini's raw response when JSON parsing fails.
+    """
+
+    workspace = "workspace"
+
+    os.makedirs(
+        workspace,
+        exist_ok=True,
+    )
+
+    response_file = os.path.join(
+        workspace,
+        f"invalid_code_generation_response_attempt_{attempt}.txt",
+    )
+
+    with open(
+        response_file,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        file.write(text or "")
+
+    return response_file
+
+
+# =========================================================
 # JSON PARSER
 # =========================================================
 
-def extract_json(text):
+def extract_json(text, attempt=1):
     """
-    Extract a JSON object from Gemini's response.
+    Extract and validate the JSON object returned by Gemini.
+
+    Handles:
+    - Markdown code fences
+    - Extra text before/after JSON
+    - Invalid backslash escapes
     """
 
     if not text:
@@ -42,7 +86,10 @@ def extract_json(text):
 
     text = text.strip()
 
-    # Remove Markdown code fences if Gemini adds them.
+    # -----------------------------------------------------
+    # Remove Markdown fences
+    # -----------------------------------------------------
+
     text = re.sub(
         r"^```json\s*",
         "",
@@ -65,17 +112,21 @@ def extract_json(text):
     text = text.strip()
 
     # -----------------------------------------------------
-    # Try normal JSON parsing first
+    # Normal JSON
     # -----------------------------------------------------
 
     try:
-        return json.loads(text)
+        data = json.loads(text)
+
+        validate_generated_structure(data)
+
+        return data
 
     except json.JSONDecodeError:
         pass
 
     # -----------------------------------------------------
-    # Find the JSON object
+    # Locate JSON object inside response
     # -----------------------------------------------------
 
     start_index = text.find("{")
@@ -91,17 +142,21 @@ def extract_json(text):
     ]
 
     # -----------------------------------------------------
-    # Try parsing the extracted object
+    # Try extracted JSON
     # -----------------------------------------------------
 
     try:
-        return json.loads(json_text)
+        data = json.loads(json_text)
+
+        validate_generated_structure(data)
+
+        return data
 
     except json.JSONDecodeError:
         pass
 
     # -----------------------------------------------------
-    # Try repairing invalid backslash escapes
+    # Repair invalid backslash escapes
     # -----------------------------------------------------
 
     repaired_json = re.sub(
@@ -111,35 +166,283 @@ def extract_json(text):
     )
 
     try:
-        return json.loads(repaired_json)
+        data = json.loads(repaired_json)
+
+        validate_generated_structure(data)
+
+        return data
 
     except json.JSONDecodeError as error:
 
-        # Save the raw response for debugging.
-        workspace = "workspace"
-
-        os.makedirs(
-            workspace,
-            exist_ok=True,
+        response_file = save_invalid_response(
+            text,
+            attempt,
         )
-
-        response_file = os.path.join(
-            workspace,
-            "invalid_code_generation_response.txt",
-        )
-
-        with open(
-            response_file,
-            "w",
-            encoding="utf-8",
-        ) as file:
-            file.write(text)
 
         raise ValueError(
             "Gemini returned malformed JSON.\n"
             f"JSON error: {error}\n"
             f"Raw response saved to: {response_file}"
+        ) from error
+
+
+# =========================================================
+# GENERATED PROJECT VALIDATION
+# =========================================================
+
+def validate_generated_structure(data):
+    """
+    Ensure Gemini returned the structure expected by
+    the project generator.
+    """
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            "Gemini response must be a JSON object."
         )
+
+    if "files" not in data:
+        raise ValueError(
+            'Gemini response is missing the "files" field.'
+        )
+
+    files = data["files"]
+
+    if not isinstance(files, list):
+        raise ValueError(
+            '"files" must be a JSON array.'
+        )
+
+    if len(files) == 0:
+        raise ValueError(
+            "Gemini returned an empty project."
+        )
+
+    for index, file_data in enumerate(files):
+
+        if not isinstance(file_data, dict):
+            raise ValueError(
+                f"File entry {index} is not an object."
+            )
+
+        if "path" not in file_data:
+            raise ValueError(
+                f"File entry {index} is missing its path."
+            )
+
+        if "content" not in file_data:
+            raise ValueError(
+                f"File entry {index} is missing its content."
+            )
+
+        path = file_data["path"]
+        content = file_data["content"]
+
+        if not isinstance(path, str):
+            raise ValueError(
+                f"File path at index {index} must be a string."
+            )
+
+        if not isinstance(content, str):
+            raise ValueError(
+                f"File content at index {index} must be a string."
+            )
+
+        # -------------------------------------------------
+        # Security validation
+        # -------------------------------------------------
+
+        normalized_path = path.replace("\\", "/")
+
+        if normalized_path.startswith("/"):
+            raise ValueError(
+                f"Absolute path detected: {path}"
+            )
+
+        if re.match(
+            r"^[A-Za-z]:",
+            normalized_path,
+        ):
+            raise ValueError(
+                f"Windows absolute path detected: {path}"
+            )
+
+        if ".." in normalized_path.split("/"):
+            raise ValueError(
+                f"Path traversal detected: {path}"
+            )
+
+        if not normalized_path.strip():
+            raise ValueError(
+                f"Empty file path at index {index}."
+            )
+
+
+# =========================================================
+# GENERATION PROMPT
+# =========================================================
+
+def build_generation_prompt(project_blueprint):
+    """
+    Build the Gemini code-generation prompt.
+    """
+
+    return f"""
+You are an expert software developer and system architect.
+
+Generate a complete runnable software project from the
+APPROVED PROJECT BLUEPRINT below.
+
+=========================================================
+APPROVED PROJECT BLUEPRINT
+=========================================================
+
+{project_blueprint}
+
+=========================================================
+IMPORTANT GENERATION RULES
+=========================================================
+
+1. Generate the application dynamically from the blueprint.
+
+2. Follow the project type, features, architecture and
+   technology stack specified in the blueprint.
+
+3. Do NOT assume the project is a Trip Planner.
+
+4. Do NOT assume the project is a Student Attendance
+   Management System.
+
+5. Do NOT force Flask, Streamlit, SQLite, React, Node.js,
+   Next.js or any other technology.
+
+6. Use the technologies explicitly specified in the blueprint.
+
+7. If the blueprint does not specify a technology,
+   choose a reasonable technology and document that
+   choice in README.md.
+
+8. Do not add unrelated features.
+
+9. Do not invent unnecessary application-specific routes,
+   tables, models or services.
+
+10. Every generated file must contain complete runnable
+    content.
+
+11. Do not generate placeholder implementations.
+
+12. Do not use TODO implementations.
+
+13. Include appropriate dependency files.
+
+14. Include README.md with setup and execution instructions.
+
+15. Do not require external API keys unless explicitly
+    required by the blueprint.
+
+16. Use relative file paths only.
+
+17. Use forward slashes in file paths.
+
+18. Never generate absolute paths.
+
+19. Never generate files outside the project.
+
+20. Include appropriate validation and error handling.
+
+=========================================================
+CRITICAL JSON REQUIREMENTS
+=========================================================
+
+Your ENTIRE response must be exactly ONE valid JSON object.
+
+Do not write any explanation before the JSON.
+
+Do not write any explanation after the JSON.
+
+Do not use Markdown code fences.
+
+Return exactly:
+
+{{
+  "files": [
+    {{
+      "path": "relative/path/to/file",
+      "content": "complete file content"
+    }}
+  ]
+}}
+
+IMPORTANT:
+
+- Every file must be represented as a JSON object.
+- "path" must be a JSON string.
+- "content" must be a JSON string.
+- Escape every double quote inside source code.
+- Escape every backslash that is part of source code.
+- Represent line breaks correctly as JSON string escapes.
+- Do not place raw unescaped newlines inside JSON strings.
+- Do not truncate file contents.
+- Do not omit source code.
+- Do not return comments describing code instead of code.
+- Do not return partial files.
+
+Before responding, mentally verify that your complete response
+is valid JSON and can be parsed by Python json.loads().
+"""
+
+
+# =========================================================
+# SINGLE GENERATION ATTEMPT
+# =========================================================
+
+def _generate_once(prompt, attempt):
+    """
+    Perform one Gemini generation attempt.
+    """
+
+    try:
+
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.1,
+                "response_mime_type": "application/json",
+            },
+            request_options={
+                "timeout": 180,
+            },
+        )
+
+    except Exception as error:
+
+        raise RuntimeError(
+            "Gemini code generation failed or timed out.\n"
+            f"Error: {error}"
+        ) from error
+
+    if not response:
+        raise RuntimeError(
+            "Gemini returned no response during code generation."
+        )
+
+    response_text = getattr(
+        response,
+        "text",
+        None,
+    )
+
+    if not response_text:
+        raise RuntimeError(
+            "Gemini returned an empty response during "
+            "code generation."
+        )
+
+    return extract_json(
+        response_text,
+        attempt=attempt,
+    )
 
 
 # =========================================================
@@ -150,109 +453,91 @@ def generate_project_files(project_blueprint):
     """
     Generate complete source-code files dynamically
     from the approved project blueprint.
+
+    Gemini gets multiple chances if it returns malformed JSON.
     """
 
-    prompt = f"""
-You are an expert software developer and
-system architect.
-
-Generate complete source-code files for the project
-described in the approved project blueprint below.
-
-APPROVED PROJECT BLUEPRINT:
-{project_blueprint}
-
-IMPORTANT RULES:
-
-1. Generate the application dynamically from the
-   approved blueprint.
-
-2. Follow the project type, features, architecture,
-   and technology stack specified in the blueprint.
-
-3. Do not assume that the project is a Trip Planner.
-
-4. Do not assume that the project is a Student
-   Attendance Management System.
-
-5. Do not force Flask, Streamlit, SQLite, React,
-   Node.js, or any other technology.
-
-6. Use the technologies explicitly specified in
-   the approved blueprint.
-
-7. If the blueprint does not specify a technology,
-   choose a reasonable technology and document
-   that choice in README.md.
-
-8. Do not add unrelated features.
-
-9. Do not use hard-coded application-specific
-   names, routes, database tables, or models
-   unless they are required by the blueprint.
-
-10. Generate files that match the requested
-    application.
-
-11. Every generated file must contain complete
-    runnable content.
-
-12. Use relative file paths only.
-
-13. Use forward slashes in file paths.
-
-14. Never generate absolute file paths.
-
-15. Never generate files outside the project.
-
-16. Include validation and error handling where
-    appropriate.
-
-17. Include requirements.txt or the appropriate
-    dependency file when required.
-
-18. Include README.md with setup and execution
-    instructions.
-
-19. Do not require external API keys unless the
-    blueprint explicitly requires an external service.
-
-20. Do not generate placeholder code.
-
-21. Do not use TODO implementations.
-
-22. Generate complete source code.
-
-23. Return ONLY valid JSON.
-
-24. Do not return Markdown outside the JSON object.
-
-25. All source-code content must be correctly
-    encoded as JSON strings.
-
-26. Correctly escape quotes, backslashes, and
-    newline characters inside file contents.
-
-27. Do not include explanations outside the JSON.
-
-Return exactly this structure:
-
-{{
-    "files": [
-        {{
-            "path": "relative/path/to/file",
-            "content": "complete file content"
-        }}
-    ]
-}}
-"""
-
-    response = model.generate_content(
-        prompt,
-        generation_config={
-            "temperature": 0.1,
-            "response_mime_type": "application/json",
-        },
+    prompt = build_generation_prompt(
+        project_blueprint
     )
 
-    return extract_json(response.text)
+    last_error = None
+
+    for attempt in range(
+        1,
+        MAX_GENERATION_ATTEMPTS + 1,
+    ):
+
+        try:
+
+            result = _generate_once(
+                prompt,
+                attempt,
+            )
+
+            # -------------------------------------------------
+            # Final structural validation
+            # -------------------------------------------------
+
+            validate_generated_structure(
+                result
+            )
+
+            return result
+
+        except ValueError as error:
+
+            last_error = error
+
+            # -------------------------------------------------
+            # Tell Gemini why the previous response failed.
+            # The next attempt gets a stricter instruction.
+            # -------------------------------------------------
+
+            prompt = build_generation_prompt(
+                project_blueprint
+            ) + f"""
+
+=========================================================
+PREVIOUS GENERATION ATTEMPT FAILED
+=========================================================
+
+Attempt: {attempt}
+
+The previous response could not be parsed as valid JSON.
+
+Error:
+{error}
+
+Generate the COMPLETE project again.
+
+This time pay special attention to JSON escaping.
+
+DO NOT output Markdown.
+
+DO NOT output explanations.
+
+DO NOT truncate the response.
+
+The response must be directly compatible with:
+
+json.loads(response_text)
+
+=========================================================
+"""
+
+            if attempt < MAX_GENERATION_ATTEMPTS:
+                time.sleep(1)
+
+        except RuntimeError:
+            raise
+
+    # ---------------------------------------------------------
+    # All attempts failed
+    # ---------------------------------------------------------
+
+    raise RuntimeError(
+        "Source-code generation failed after "
+        f"{MAX_GENERATION_ATTEMPTS} attempts.\n"
+        f"Last error: {last_error}"
+    ) from last_error

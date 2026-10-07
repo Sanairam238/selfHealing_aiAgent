@@ -22,6 +22,7 @@ def build_recovery_graph():
     error_types = [
         "syntax_error",
         "dependency_error",
+        "runtime_error",
         "database_error",
         "file_error",
         "port_error",
@@ -70,6 +71,20 @@ def build_recovery_graph():
     graph.add_edge(
         "dependency_error",
         "repair_dependencies",
+    )
+
+    # Runtime application-code errors such as:
+    #
+    # NameError
+    # AttributeError
+    # TypeError
+    # ValueError
+    # KeyError
+    #
+    # are sent to source-code repair.
+    graph.add_edge(
+        "runtime_error",
+        "repair_source_code",
     )
 
     graph.add_edge(

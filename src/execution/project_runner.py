@@ -1,176 +1,179 @@
-import socket
-import subprocess
+import os
 import sys
+import subprocess
+import ast
 import time
 from pathlib import Path
 
 
-COMMAND_TIMEOUT = 30
-APPLICATION_STARTUP_TIMEOUT = 8
+def discover_entrypoint(project_directory):
+    """
+    Find the most likely application entrypoint.
+    """
 
-EXCLUDED_DIRECTORIES = {
-    ".venv",
-    "venv",
-    "env",
-    "__pycache__",
-    ".git",
-    "node_modules",
-}
+    project_directory = Path(project_directory)
 
+    preferred_files = [
+        "app.py",
+        "main.py",
+        "run.py",
+        "server.py",
+    ]
 
-def run_command(command, cwd, timeout=COMMAND_TIMEOUT):
-    try:
-        result = subprocess.run(
-            command,
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            encoding="utf-8",
-            errors="replace",
-        )
+    # Check root-level entrypoints first
+    for filename in preferred_files:
+        candidate = project_directory / filename
 
-        return {
-            "success": result.returncode == 0,
-            "returncode": result.returncode,
-            "stdout": result.stdout.strip(),
-            "stderr": result.stderr.strip(),
-            "timed_out": False,
-        }
+        if candidate.exists():
+            return candidate
 
-    except subprocess.TimeoutExpired as error:
-        return {
-            "success": False,
-            "returncode": None,
-            "stdout": str(error.stdout or ""),
-            "stderr": str(error.stderr or ""),
-            "timed_out": True,
-        }
+    # Then check common backend directories
+    for directory in ["backend", "src"]:
+        folder = project_directory / directory
 
-    except Exception as error:
-        return {
-            "success": False,
-            "returncode": None,
-            "stdout": "",
-            "stderr": str(error),
-            "timed_out": False,
-        }
+        if folder.exists():
+            for filename in preferred_files:
+                candidate = folder / filename
 
+                if candidate.exists():
+                    return candidate
 
-def discover_python_files(project_directory):
-    project_path = Path(project_directory).resolve()
+    # Fallback: first Python file found
+    python_files = list(project_directory.rglob("*.py"))
 
-    files = []
-
-    for path in project_path.rglob("*.py"):
-        relative_parts = path.relative_to(project_path).parts
-
-        if any(
-            part in EXCLUDED_DIRECTORIES
-            for part in relative_parts
-        ):
-            continue
-
-        files.append(path.resolve())
-
-    return sorted(files)
-
-
-def check_python_syntax(project_directory):
-    project_path = Path(project_directory).resolve()
-
-    python_files = discover_python_files(project_path)
-
-    if not python_files:
-        return {
-            "success": True,
-            "checked_files": 0,
-            "message": "No Python files found.",
-        }
-
-    failures = []
-
-    for python_file in python_files:
-        absolute_file = str(python_file)
-
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "py_compile",
-                absolute_file,
-            ],
-            cwd=str(project_path),
-            capture_output=True,
-            text=True,
-            timeout=10,
-            encoding="utf-8",
-            errors="replace",
-        )
-
-        if result.returncode != 0:
-            failures.append(
-                {
-                    "file": str(
-                        python_file.relative_to(project_path)
-                    ),
-                    "error": (
-                        result.stderr.strip()
-                        or result.stdout.strip()
-                    ),
-                }
-            )
-
-    if failures:
-        return {
-            "success": False,
-            "checked_files": len(python_files),
-            "failures": failures,
-            "message": "Python syntax validation failed.",
-        }
-
-    return {
-        "success": True,
-        "checked_files": len(python_files),
-        "message": "Python syntax validation passed.",
+    excluded_parts = {
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".git",
+        "node_modules",
     }
 
+    python_files = [
+        file
+        for file in python_files
+        if not any(part in excluded_parts for part in file.parts)
+    ]
 
-def find_requirements_file(project_directory):
-    project_path = Path(project_directory).resolve()
-
-    for filename in [
-        "requirements.txt",
-        "requirements-dev.txt",
-    ]:
-        path = project_path / filename
-
-        if path.exists():
-            return path
+    if python_files:
+        return python_files[0]
 
     return None
 
 
-def check_requirements_file(project_directory):
-    requirements = find_requirements_file(project_directory)
+def detect_framework(entrypoint):
+    """
+    Detect framework from the actual entrypoint file.
+    """
 
-    if requirements is None:
-        return {
-            "success": True,
-            "message": "No requirements.txt found. Dependency installation skipped.",
-        }
+    if not entrypoint:
+        return "unknown"
 
     try:
-        content = requirements.read_text(
+        content = Path(entrypoint).read_text(
             encoding="utf-8",
-            errors="replace",
-        ).strip()
+            errors="ignore",
+        ).lower()
 
-        if not content:
-            return {
-                "success": False,
-                "message": "requirements.txt is empty.",
-            }
+    except Exception:
+        return "unknown"
+
+    if "streamlit" in content:
+        return "streamlit"
+
+    if "flask" in content:
+        return "flask"
+
+    if "fastapi" in content:
+        return "fastapi"
+
+    if "django" in content:
+        return "django"
+
+    return "python"
+
+
+def check_python_syntax(project_directory):
+    """
+    Compile every Python file to detect syntax errors.
+    """
+
+    project_directory = Path(project_directory)
+
+    python_files = []
+
+    excluded_parts = {
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".git",
+        "node_modules",
+    }
+
+    for file in project_directory.rglob("*.py"):
+
+        if any(part in excluded_parts for part in file.parts):
+            continue
+
+        python_files.append(file)
+
+    errors = []
+
+    for file in python_files:
+
+        try:
+
+            source = file.read_text(
+                encoding="utf-8",
+                errors="ignore",
+            )
+
+            ast.parse(
+                source,
+                filename=str(file),
+            )
+
+        except SyntaxError as error:
+
+            errors.append(
+                f"{file}: line {error.lineno}: {error.msg}"
+            )
+
+        except Exception as error:
+
+            errors.append(
+                f"{file}: {error}"
+            )
+
+    if errors:
+
+        return {
+            "success": False,
+            "message": "Syntax errors found.",
+            "errors": errors,
+        }
+
+    return {
+        "success": True,
+        "message": (
+            f"Syntax check passed ({len(python_files)} files)."
+        ),
+        "errors": [],
+    }
+
+
+def check_dependencies(project_directory):
+    """
+    Check whether a dependency configuration file exists.
+    """
+
+    project_directory = Path(project_directory)
+
+    requirements_file = (
+        project_directory / "requirements.txt"
+    )
+
+    if requirements_file.exists():
 
         return {
             "success": True,
@@ -180,499 +183,796 @@ def check_requirements_file(project_directory):
             ),
         }
 
-    except Exception as error:
-        return {
-            "success": False,
-            "message": f"Could not read requirements.txt: {error}",
-        }
+    return {
+        "success": True,
+        "message": (
+            "No requirements.txt found. "
+            "Dependency check skipped."
+        ),
+    }
 
 
-def discover_test_files(project_directory):
-    project_path = Path(project_directory).resolve()
+def check_database_files(project_directory):
+    """
+    Perform lightweight database checks.
+    """
 
-    tests = []
+    project_directory = Path(project_directory)
 
-    for path in project_path.rglob("*.py"):
-        relative_parts = path.relative_to(project_path).parts
+    database_paths = []
 
-        if any(
-            part in EXCLUDED_DIRECTORIES
-            for part in relative_parts
-        ):
+    excluded_parts = {
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".git",
+        "node_modules",
+    }
+
+    for file in project_directory.rglob("*.py"):
+
+        if any(part in excluded_parts for part in file.parts):
             continue
 
-        filename = path.name.lower()
+        try:
 
-        if (
-            filename.startswith("test_")
-            or filename.endswith("_test.py")
-        ):
-            tests.append(path)
+            content = file.read_text(
+                encoding="utf-8",
+                errors="ignore",
+            )
 
-    return sorted(tests)
+        except Exception:
+            continue
 
+        if "sqlite3.connect" not in content:
+            continue
 
-def run_tests(project_directory):
-    test_files = discover_test_files(project_directory)
+        lines = content.splitlines()
 
-    if not test_files:
-        return {
-            "success": True,
-            "tests_found": 0,
-            "message": "No test files found. Tests skipped.",
-        }
+        for line in lines:
 
-    result = run_command(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-        ],
-        Path(project_directory).resolve(),
-        timeout=20,
-    )
+            if "sqlite3.connect" not in line:
+                continue
 
-    if not result["success"]:
+            for quote in ['"', "'"]:
+
+                parts = line.split(quote)
+
+                for part in parts:
+
+                    if (
+                        ".db" in part
+                        or ".sqlite" in part
+                        or ".sqlite3" in part
+                    ):
+
+                        database_paths.append(
+                            project_directory / part
+                        )
+
+    unique_paths = []
+
+    for path in database_paths:
+
+        if path not in unique_paths:
+            unique_paths.append(path)
+
+    warnings = []
+
+    for db_path in unique_paths:
+
+        parent_directory = db_path.parent
+
+        if not parent_directory.exists():
+
+            warnings.append(
+                "Database directory does not exist: "
+                f"{parent_directory}"
+            )
+
+    if warnings:
+
         return {
             "success": False,
-            "tests_found": len(test_files),
-            "stdout": result["stdout"],
-            "stderr": result["stderr"],
             "message": (
-                "Tests timed out."
-                if result["timed_out"]
-                else "Tests failed."
+                "Database configuration problem detected."
             ),
+            "errors": warnings,
         }
 
     return {
         "success": True,
-        "tests_found": len(test_files),
-        "stdout": result["stdout"],
-        "stderr": result["stderr"],
-        "message": "Tests passed.",
+        "message": "Database path check passed.",
+        "errors": [],
     }
 
 
-def find_free_port():
-    sock = socket.socket(
-        socket.AF_INET,
-        socket.SOCK_STREAM,
+def run_database_smoke_test(project_directory):
+    """
+    Run a lightweight database initialization smoke test.
+    """
+
+    project_directory = Path(project_directory)
+
+    database_files = list(
+        project_directory.rglob("database.py")
     )
 
-    sock.bind(("127.0.0.1", 0))
+    excluded_parts = {
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".git",
+        "node_modules",
+    }
 
-    port = sock.getsockname()[1]
-
-    sock.close()
-
-    return port
-
-
-def detect_framework(entrypoint):
-    """
-    Detect the framework used by the specific application entrypoint.
-
-    This is intentionally entrypoint-specific because a project can contain
-    both a Flask backend and a Streamlit frontend.
-    """
-
-    entrypoint = Path(entrypoint).resolve()
-
-    try:
-        content = entrypoint.read_text(
-            encoding="utf-8",
-            errors="replace",
-        ).lower()
-    except Exception:
-        return "python"
-
-    # Check FastAPI first because it normally exposes an ASGI app.
-    if (
-        "from fastapi import" in content
-        or "import fastapi" in content
-    ):
-        return "fastapi"
-
-    # Flask backend.
-    if (
-        "from flask import" in content
-        or "import flask" in content
-        or "flask(" in content
-    ):
-        return "flask"
-
-    # Streamlit frontend.
-    if (
-        "import streamlit" in content
-        or "from streamlit" in content
-        or "st." in content
-    ):
-        return "streamlit"
-
-    return "python"
-
-
-def discover_entrypoint(project_directory):
-    project_path = Path(project_directory).resolve()
-
-    preferred_names = [
-        "app.py",
-        "main.py",
-        "run.py",
-        "server.py",
+    database_files = [
+        file
+        for file in database_files
+        if not any(
+            part in excluded_parts
+            for part in file.parts
+        )
     ]
 
-    candidates = []
+    if not database_files:
 
-    # Prefer root-level entrypoints.
-    for filename in preferred_names:
-        root_file = project_path / filename
-
-        if root_file.exists():
-            candidates.append(root_file.resolve())
-
-    # Then search subdirectories.
-    for filename in preferred_names:
-        for path in project_path.rglob(filename):
-
-            relative_parts = path.relative_to(project_path).parts
-
-            if any(
-                part in EXCLUDED_DIRECTORIES
-                for part in relative_parts
-            ):
-                continue
-
-            absolute_path = path.resolve()
-
-            if absolute_path not in candidates:
-                candidates.append(absolute_path)
-
-    if not candidates:
-        return None
-
-    # Prefer backend entrypoints when both frontend and backend
-    # applications exist.
-    backend_candidates = [
-        path
-        for path in candidates
-        if "backend" in path.relative_to(project_path).parts
-    ]
-
-    if backend_candidates:
-        return backend_candidates[0]
-
-    return candidates[0]
-
-def start_application(project_directory):
-    project_path = Path(project_directory).resolve()
-
-    entrypoint = discover_entrypoint(project_path)
-
-    if entrypoint is None:
         return {
             "success": True,
-            "checked": False,
-            "message": "No application entry point found.",
+            "message": (
+                "No database.py found. "
+                "Database smoke test skipped."
+            ),
+            "output": "",
         }
 
-    # Detect framework from the actual entrypoint.
-    framework = detect_framework(entrypoint)
+    database_file = database_files[0]
 
-    relative_entrypoint = entrypoint.relative_to(project_path)
+    relative_parent = database_file.parent.relative_to(
+        project_directory
+    )
 
-    port = find_free_port()
+    module_name = database_file.stem
 
-    # ---------------------------------------------------------
-    # Build command
-    # ---------------------------------------------------------
+    command = [
+        sys.executable,
+        "-c",
+        (
+            f"import sys; "
+            f"sys.path.insert(0, r'{relative_parent}'); "
+            f"import {module_name}; "
+            f"getattr({module_name}, 'init_db', lambda: None)()"
+        ),
+    ]
 
-    if framework == "streamlit":
+    try:
 
-        command = [
-            sys.executable,
-            "-m",
-            "streamlit",
-            "run",
-            str(relative_entrypoint),
-            "--server.headless",
-            "true",
-            "--server.port",
-            str(port),
-        ]
-
-        working_directory = project_path
-
-    elif framework == "fastapi":
-
-        module_name = (
-            relative_entrypoint
-            .with_suffix("")
-            .as_posix()
-            .replace("/", ".")
+        result = subprocess.run(
+            command,
+            cwd=str(database_file.parent),
+            capture_output=True,
+            text=True,
+            timeout=20,
         )
 
-        command = [
-            sys.executable,
-            "-m",
-            "uvicorn",
-            f"{module_name}:app",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-        ]
+        output = (
+            (result.stdout or "")
+            + "\n"
+            + (result.stderr or "")
+        ).strip()
 
-        working_directory = project_path
+        if result.returncode != 0:
 
-    elif framework == "flask":
+            return {
+                "success": False,
+                "message": "Database smoke test failed.",
+                "output": output,
+            }
 
-        # IMPORTANT:
-        # Do NOT execute "python backend/app.py" directly.
-        #
-        # The generated Flask applications may use:
-        #
-        #     app.run(debug=True)
-        #
-        # which starts Flask's Windows reloader.
-        #
-        # Instead, import the Flask app and start it ourselves
-        # with debug=False and use_reloader=False.
-        #
-        # This makes application startup validation deterministic.
+        return {
+            "success": True,
+            "message": "Database smoke test passed.",
+            "output": output,
+        }
 
-        backend_directory = entrypoint.parent
+    except subprocess.TimeoutExpired:
 
-        command = [
-            sys.executable,
-            "-c",
-            (
-                "from app import app; "
-                f"app.run(host='127.0.0.1', port={port}, "
-                "debug=False, use_reloader=False)"
+        return {
+            "success": False,
+            "message": "Database smoke test timed out.",
+            "output": (
+                "Database initialization exceeded "
+                "20 seconds."
             ),
-        ]
+        }
 
-        working_directory = backend_directory
+    except Exception as error:
 
-    else:
+        return {
+            "success": False,
+            "message": (
+                "Database smoke test could not be executed."
+            ),
+            "output": str(error),
+        }
 
-        command = [
-            sys.executable,
-            str(relative_entrypoint),
-        ]
 
-        working_directory = project_path
+def _contains_runtime_error(output):
+    """
+    Detect real Python/application exceptions in captured output.
 
-    # ---------------------------------------------------------
-    # Start application
-    # ---------------------------------------------------------
+    Streamlit can print warnings such as:
+    'Missing Submit Button'
+
+    Those warnings are NOT treated as application failures.
+
+    Actual Python exceptions such as NameError, TypeError,
+    AttributeError, etc. ARE treated as failures.
+    """
+
+    if not output:
+        return False
+
+    output_lower = output.lower()
+
+    exception_markers = [
+        "traceback (most recent call last):",
+        "syntaxerror:",
+        "nameerror:",
+        "unboundlocalerror:",
+        "modulenotfounderror:",
+        "importerror:",
+        "attributeerror:",
+        "typeerror:",
+        "valueerror:",
+        "keyerror:",
+        "indexerror:",
+        "filenotfounderror:",
+        "permissionerror:",
+        "runtimeerror:",
+        "assertionerror:",
+        "zerodivisionerror:",
+        "recursionerror:",
+        "overflowerror:",
+    ]
+
+    return any(
+        marker in output_lower
+        for marker in exception_markers
+    )
+
+
+def _run_streamlit_and_capture(
+    entrypoint,
+    timeout=8,
+):
+    """
+    Start Streamlit, allow the script to execute, then terminate
+    the server and capture the complete stdout/stderr output.
+
+    This is intentionally different from simply sleeping for a
+    few seconds and immediately reading the pipes. Streamlit is a
+    long-running server, so communicate() must happen after the
+    process is terminated or after a timeout.
+    """
+
+    entrypoint = Path(entrypoint)
+
+    command = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        entrypoint.name,
+        "--server.headless",
+        "true",
+        "--server.port",
+        "8502",
+        "--browser.gatherUsageStats",
+        "false",
+    ]
+
+    process = None
 
     try:
 
         process = subprocess.Popen(
             command,
-            cwd=str(working_directory),
-            stdout=subprocess.DEVNULL,
+            cwd=str(entrypoint.parent),
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
         )
 
-    except Exception as error:
+        # Give Streamlit enough time to:
+        #
+        # 1. start the server
+        # 2. execute the user's script
+        # 3. produce a traceback if the script is broken
+        #
+        time.sleep(4)
 
-        return {
-            "success": False,
-            "entrypoint": str(relative_entrypoint),
-            "framework": framework,
-            "message": f"Could not start application: {error}",
-        }
+        # If Streamlit already exited, collect everything.
+        if process.poll() is not None:
 
-    start_time = time.time()
+            stdout, stderr = process.communicate(
+                timeout=3
+            )
 
-    # ---------------------------------------------------------
-    # Monitor startup
-    # ---------------------------------------------------------
-
-    while time.time() - start_time < APPLICATION_STARTUP_TIMEOUT:
-
-        returncode = process.poll()
-
-        # -----------------------------------------------------
-        # Application exited before startup timeout.
-        # -----------------------------------------------------
-
-        if returncode is not None:
-
-            try:
-                stderr = process.stderr.read() if process.stderr else ""
-            except Exception:
-                stderr = ""
-
-            output = stderr.strip()
+            output = (
+                (stdout or "")
+                + "\n"
+                + (stderr or "")
+            ).strip()
 
             return {
-                "success": returncode == 0,
-                "entrypoint": str(relative_entrypoint),
-                "framework": framework,
-                "returncode": returncode,
+                "success": not _contains_runtime_error(output),
                 "output": output,
-                "message": (
-                    "Application exited successfully."
-                    if returncode == 0
-                    else "Application failed during startup."
-                ),
+                "process_exited": True,
             }
 
-        time.sleep(0.25)
-
-    # ---------------------------------------------------------
-    # Application survived startup window.
-    # ---------------------------------------------------------
-
-    try:
-
+        # Streamlit is normally supposed to stay alive.
+        #
+        # Terminate it now so communicate() can collect all buffered
+        # stdout/stderr without blocking forever.
         process.terminate()
 
         try:
-            process.wait(timeout=3)
+
+            stdout, stderr = process.communicate(
+                timeout=3
+            )
 
         except subprocess.TimeoutExpired:
 
             process.kill()
-            process.wait(timeout=3)
 
-    except Exception:
-        pass
+            stdout, stderr = process.communicate()
 
-    return {
-        "success": True,
-        "entrypoint": str(relative_entrypoint),
-        "framework": framework,
-        "returncode": 0,
-        "output": "",
-        "message": (
-            "Application started successfully "
-            "and passed the startup check."
-        ),
-    }
+        output = (
+            (stdout or "")
+            + "\n"
+            + (stderr or "")
+        ).strip()
 
-def run_application(project_directory):
-    return start_application(project_directory)
+        return {
+            "success": not _contains_runtime_error(output),
+            "output": output,
+            "process_exited": False,
+        }
 
+    except Exception as error:
 
-def run_project_checks(project_directory):
+        if process is not None:
 
-    project_path = Path(project_directory).resolve()
-
-    if not project_path.exists():
+            try:
+                process.kill()
+                process.communicate(timeout=3)
+            except Exception:
+                pass
 
         return {
             "success": False,
-            "stage": "project",
-            "summary": (
-                f"Project directory does not exist: "
-                f"{project_path}"
-            ),
+            "output": str(error),
+            "process_exited": True,
         }
+
+
+def check_application_startup(
+    project_directory,
+    timeout=8,
+):
+    """
+    Start the detected application briefly to verify startup.
+
+    Streamlit applications receive two levels of validation:
+
+    1. Direct Python import check for import-time failures.
+    2. Actual Streamlit execution to detect runtime errors that
+       only occur when Streamlit executes the page.
+    """
+
+    project_directory = Path(project_directory)
+
+    entrypoint = discover_entrypoint(
+        project_directory
+    )
+
+    if not entrypoint:
+
+        return {
+            "success": False,
+            "message": "No application entrypoint found.",
+            "output": "",
+        }
+
+    framework = detect_framework(
+        entrypoint
+    )
+
+    process = None
+
+    try:
+
+        # =========================================================
+        # STREAMLIT PREFLIGHT IMPORT CHECK
+        # =========================================================
+
+        if framework == "streamlit":
+
+            import_command = [
+                sys.executable,
+                "-c",
+                f"import {entrypoint.stem}",
+            ]
+
+            import_result = subprocess.run(
+                import_command,
+                cwd=str(entrypoint.parent),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+            )
+
+            import_output = (
+                (import_result.stdout or "")
+                + "\n"
+                + (import_result.stderr or "")
+            ).strip()
+
+            if import_result.returncode != 0:
+
+                return {
+                    "success": False,
+                    "message": (
+                        "Application import failed."
+                    ),
+                    "output": import_output,
+                    "entrypoint": str(entrypoint),
+                    "framework": framework,
+                }
+
+            # -----------------------------------------------------
+            # IMPORTANT:
+            #
+            # A normal Python import is not enough for Streamlit.
+            # Streamlit executes the script through its own runtime.
+            #
+            # Therefore we STILL run the actual Streamlit app.
+            # -----------------------------------------------------
+
+            streamlit_result = (
+                _run_streamlit_and_capture(
+                    entrypoint,
+                    timeout=timeout,
+                )
+            )
+
+            streamlit_output = (
+                streamlit_result.get(
+                    "output",
+                    ""
+                )
+            )
+
+            if not streamlit_result["success"]:
+
+                return {
+                    "success": False,
+                    "message": (
+                        "Application runtime error detected."
+                    ),
+                    "output": streamlit_output,
+                    "entrypoint": str(entrypoint),
+                    "framework": framework,
+                }
+
+            return {
+                "success": True,
+                "message": (
+                    "Streamlit application started "
+                    "and executed successfully."
+                ),
+                "output": streamlit_output,
+                "entrypoint": str(entrypoint),
+                "framework": framework,
+            }
+
+        # =========================================================
+        # FLASK
+        # =========================================================
+
+        if framework == "flask":
+
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "from app import app; "
+                    "app.run("
+                    "host='127.0.0.1', "
+                    "port=5001, "
+                    "debug=False, "
+                    "use_reloader=False"
+                    ")"
+                ),
+            ]
+
+        # =========================================================
+        # OTHER PYTHON APPLICATIONS
+        # =========================================================
+
+        else:
+
+            command = [
+                sys.executable,
+                entrypoint.name,
+            ]
+
+        # =========================================================
+        # START APPLICATION
+        # =========================================================
+
+        process = subprocess.Popen(
+            command,
+            cwd=str(entrypoint.parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        time.sleep(3)
+
+        # =========================================================
+        # APPLICATION EXITED
+        # =========================================================
+
+        if process.poll() is not None:
+
+            stdout, stderr = process.communicate(
+                timeout=3
+            )
+
+            output = (
+                (stdout or "")
+                + "\n"
+                + (stderr or "")
+            ).strip()
+
+            return {
+                "success": False,
+                "message": (
+                    "Application failed during startup."
+                ),
+                "output": output,
+                "entrypoint": str(entrypoint),
+                "framework": framework,
+            }
+
+        # =========================================================
+        # APPLICATION STILL RUNNING
+        # =========================================================
+
+        process.terminate()
+
+        try:
+
+            stdout, stderr = process.communicate(
+                timeout=3
+            )
+
+        except subprocess.TimeoutExpired:
+
+            process.kill()
+
+            stdout, stderr = process.communicate()
+
+        output = (
+            (stdout or "")
+            + "\n"
+            + (stderr or "")
+        ).strip()
+
+        if _contains_runtime_error(output):
+
+            return {
+                "success": False,
+                "message": (
+                    "Application runtime error detected."
+                ),
+                "output": output,
+                "entrypoint": str(entrypoint),
+                "framework": framework,
+            }
+
+        return {
+            "success": True,
+            "message": (
+                "Application started successfully."
+            ),
+            "output": output,
+            "entrypoint": str(entrypoint),
+            "framework": framework,
+        }
+
+    except Exception as error:
+
+        if process is not None:
+
+            try:
+                process.kill()
+                process.communicate(timeout=3)
+            except Exception:
+                pass
+
+        return {
+            "success": False,
+            "message": (
+                "Application startup check failed."
+            ),
+            "output": str(error),
+            "entrypoint": str(entrypoint),
+            "framework": framework,
+        }
+
+
+def run_project_checks(project_directory):
+    """
+    Run the complete project validation pipeline.
+    """
+
+    print("\n--- PROJECT VALIDATION ---")
+
+    project_directory = Path(
+        project_directory
+    )
+
+    # --------------------------------------------------
+    # 1. Syntax
+    # --------------------------------------------------
 
     print("Checking Python syntax...")
 
-    syntax = check_python_syntax(project_path)
+    syntax_result = check_python_syntax(
+        project_directory
+    )
 
-    if not syntax["success"]:
+    print(syntax_result["message"])
+
+    if not syntax_result["success"]:
 
         return {
             "success": False,
             "stage": "syntax",
-            "syntax": syntax,
-            "summary": syntax["message"],
+            "output": "\n".join(
+                syntax_result["errors"]
+            ),
         }
+
+    # --------------------------------------------------
+    # 2. Dependencies
+    # --------------------------------------------------
 
     print(
-        f"Syntax check passed "
-        f"({syntax['checked_files']} files)."
+        "Checking dependency configuration..."
     )
 
-    print("Checking dependency configuration...")
+    dependency_result = check_dependencies(
+        project_directory
+    )
 
-    dependencies = check_requirements_file(project_path)
+    print(
+        dependency_result["message"]
+    )
 
-    if not dependencies["success"]:
+    # --------------------------------------------------
+    # 3. Database path configuration
+    # --------------------------------------------------
+
+    print(
+        "Checking database configuration..."
+    )
+
+    database_config_result = (
+        check_database_files(
+            project_directory
+        )
+    )
+
+    print(
+        database_config_result["message"]
+    )
+
+    if not database_config_result["success"]:
 
         return {
             "success": False,
-            "stage": "dependencies",
-            "syntax": syntax,
-            "dependencies": dependencies,
-            "summary": dependencies["message"],
+            "stage": "database",
+            "output": "\n".join(
+                database_config_result["errors"]
+            ),
         }
 
-    print(dependencies["message"])
+    # --------------------------------------------------
+    # 4. Database smoke test
+    # --------------------------------------------------
 
-    print("Checking tests...")
+    print(
+        "Running database smoke test..."
+    )
 
-    tests = run_tests(project_path)
-
-    if not tests["success"]:
-
-        summary = "\n".join(
-            part
-            for part in [
-                tests.get("stdout", ""),
-                tests.get("stderr", ""),
-                tests.get("message", ""),
-            ]
-            if part
+    database_smoke_result = (
+        run_database_smoke_test(
+            project_directory
         )
+    )
+
+    print(
+        database_smoke_result["message"]
+    )
+
+    if not database_smoke_result["success"]:
 
         return {
             "success": False,
-            "stage": "tests",
-            "syntax": syntax,
-            "dependencies": dependencies,
-            "tests": tests,
-            "summary": summary,
+            "stage": "database",
+            "output": database_smoke_result["output"],
         }
 
-    print(tests["message"])
+    # --------------------------------------------------
+    # 5. Application startup/runtime
+    # --------------------------------------------------
 
-    print("Checking application startup...")
+    print(
+        "Checking application startup..."
+    )
 
-    application = run_application(project_path)
-
-    if not application["success"]:
-
-        summary = "\n".join(
-            part
-            for part in [
-                application.get("output", ""),
-                application.get("message", ""),
-            ]
-            if part
+    startup_result = (
+        check_application_startup(
+            project_directory
         )
+    )
+
+    print(
+        startup_result["message"]
+    )
+
+    if not startup_result["success"]:
 
         return {
             "success": False,
             "stage": "application",
-            "syntax": syntax,
-            "dependencies": dependencies,
-            "tests": tests,
-            "application": application,
-            "summary": summary,
+            "output": startup_result["output"],
+            "entrypoint": startup_result.get(
+                "entrypoint"
+            ),
+            "framework": startup_result.get(
+                "framework"
+            ),
         }
 
-    print(application["message"])
+    # --------------------------------------------------
+    # Everything passed
+    # --------------------------------------------------
+
+    print(
+        "Project validation PASSED."
+    )
 
     return {
         "success": True,
-        "stage": "complete",
-        "syntax": syntax,
-        "dependencies": dependencies,
-        "tests": tests,
-        "application": application,
-        "summary": "All fast project checks passed.",
+        "stage": "validation",
+        "output": "All project checks passed.",
+        "entrypoint": startup_result.get(
+            "entrypoint"
+        ),
+        "framework": startup_result.get(
+            "framework"
+        ),
     }
