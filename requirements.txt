@@ -2,3 +2,4 @@ streamlit
 python-dotenv
 google-genai
 google-generativeai
+langgraph
